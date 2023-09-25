@@ -70,7 +70,6 @@ class SigV4Signer:
         if not s.startswith(sigv4AuthHeaderStart):
             _logger.error(f"unable to parse header: {s}")
             return None
-        # AWS4-HMAC-SHA256 Credential=ASIA4PIQJUFMM2YM3LPC/20230925/us-east-1/sts/aws4_request, SignedHeaders=accept-encoding;content-type;host;x-amz-date;x-amz-security-token, Signature=4d06aa26c92bba7d124ea2b9018f561c2053fece9f7510acdf0bf3b31198ffc4 
         authHeaderRaw = s[len(sigv4AuthHeaderStart):].strip()
         authHeaderParts = authHeaderRaw.split(",")
         authHeader = {x.split("=")[0].strip(): x.split("=")[1].strip() for x in authHeaderParts}
