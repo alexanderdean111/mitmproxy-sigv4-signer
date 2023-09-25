@@ -5,6 +5,6 @@ Adapted from
 <https://docs.aws.amazon.com/general/latest/gr/sigv4-signed-request-examples.html>
 
 Usage:
-  `mitmproxy -s sigv4_signer.py`
+  `mitmproxy -s add_sigv4_signature.py`
 
 
