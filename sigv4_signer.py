@@ -1,114 +1,145 @@
-#!/usr/bin/env python
+import os
+import json
+import logging
+import sys
+import copy
+from urllib.parse import urlparse
 
-import sys, os, base64, datetime, hashlib, hmac
+import botocore
+import boto3
+import requests
 
-# replace with name of credential to use from ~/.aws/credentials
-# otherwise will try to pull and resign with whatever cred was used
-# in the request
+_logger = logging.getLogger("SigV4Signer")
 
-USE_CRED = None
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S%z",
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(sys.stderr)
+    ]
+)
 
-def load_creds_file():
-    creds_file = "{}/.aws/credentials".format(os.environ.get("HOME"))
-    with open(creds_file) as f:
-        lines = f.readlines()
+class SigV4Signer:
+    def __init__(self, profile_name="default"):
+        # load credentials from 'default' profile
+        self._session = boto3.session.Session(profile_name=profile_name)
+        self._credential = self._session.get_credentials().get_frozen_credentials()
+        _logger.info(f"loaded credential {self._credential.access_key} from 'default' profile")
 
-    entries = {}
-    while lines:
-        line = lines.pop(0)
-        if line.strip().startswith('[') and line.strip().endswith(']'):
-            name = line.strip()[1:-1]
-            entry = {}
-            while lines:
-                next_line = lines.pop(0)
-                if next_line.strip().startswith('[') and line.strip().endswith(']'):
-                    lines = [line] + lines
-                    break
-                try:
-                    param, value = next_line.split('=')
-                    param = param.strip()
-                    value = value.strip()
-                    entry[param] = value
-                except:
-                    break
-            entries[name] = entry
-    return entries
+    def generateSignedRequest(self, method, url, params, headers, bodyBytes, service=None, region=None):
+        # feed information into botocore and have it generate the signature for us
+
+        _logger.info(f"generating SigV4 auth header for {method} {url}")
+        req = botocore.awsrequest.AWSRequest(
+            method=method,
+            url=url,
+            data=bodyBytes,
+            params=params,
+            headers=headers
+        )
+
+        # if region or service not provided, try to guess from existing auth header
+        if not service or not region:
+            _logger.info("trying to parse service/region from request")
+            if "Authorization" in req.headers:
+                # find "Credential=" so the first item in our split() is the one we want
+                credentialIndex = req.headers['Authorization'].find("Credential=")
+                credentialHeader = req.headers['Authorization'][credentialIndex:].split(",")[0]
+                credentialValues = credentialHeader.split("=")[1]
+
+                reqAccessKey = credentialValues.split("/")[0]
+                reqRegion = credentialValues.split("/")[2]
+                reqService = credentialValues.split("/")[3]
+
+                _logger.info(f"got service: {reqService} and region: {reqRegion}")
+
+        if not service:
+            _logger.debug(f"service not provided, using {reqService} from request")
+            service = reqService
+
+        if not region:
+            _logger.debug("region not provided, using {reqRegion} from request")
+            region = reqRegion
+
+        botocore.auth.SigV4Auth(self._credential, service, region).add_auth(req)
+        return req
+
+    def parseAWSAuthHeader(self, s):
+        sigv4AuthHeaderStart = "AWS4-HMAC-SHA256"
+        if not s.startswith(sigv4AuthHeaderStart):
+            _logger.error(f"unable to parse header: {s}")
+            return None
+        # AWS4-HMAC-SHA256 Credential=ASIA4PIQJUFMM2YM3LPC/20230925/us-east-1/sts/aws4_request, SignedHeaders=accept-encoding;content-type;host;x-amz-date;x-amz-security-token, Signature=4d06aa26c92bba7d124ea2b9018f561c2053fece9f7510acdf0bf3b31198ffc4 
+        authHeaderRaw = s[len(sigv4AuthHeaderStart):].strip()
+        authHeaderParts = authHeaderRaw.split(",")
+        authHeader = {x.split("=")[0].strip(): x.split("=")[1].strip() for x in authHeaderParts}
+
+        return authHeader
 
 
-def sign(key, msg):
-    return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
+if __name__ == "__main__":
 
-def getSignatureKey(key, dateStamp, regionName, serviceName):
-    kDate = sign(('AWS4' + key).encode('utf-8'), dateStamp)
-    kRegion = sign(kDate, regionName)
-    kService = sign(kRegion, serviceName)
-    kSigning = sign(kService, 'aws4_request')
-    return kSigning
+    sigV4Signer = SigV4Signer()
+    # generate an STS get_caller_identity request and sign with botocore
+    method = "POST"
+    host = "sts.amazonaws.com"
+    path = "/"
+    headers = {
+        "Host": "sts.amazonaws.com",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+        "User-Agent": "aws-cli/1.18.69 Python/3.8.10 Linux/5.4.0-162-generic botocore/1.16.19",
+    }
+    bodyBytes = "Action=GetCallerIdentity&Version=2011-06-15"
+    region = "us-east-1"
+    service = "sts"
 
+    # generateSignedRequest(self, method, url, params, headers, bodyBytes, service=None, region=None):
 
-def request(flow):
-    if "AWS4-HMAC-SHA256" in flow.request.headers["Authorization"]:
-        t = datetime.datetime.utcnow()
-        amzdate = t.strftime('%Y%m%dT%H%M%SZ')
-        datestamp = t.strftime('%Y%m%d') # Date w/o time, used in credential scope
+    req = sigV4Signer.generateSignedRequest(method, f"https://{host}{path}", None, headers=headers, bodyBytes=bodyBytes, service=service, region=region)
 
-        authz_header = flow.request.headers["Authorization"]
-        authz_header_items = authz_header.split()[1:]
-        authz_header_items = {x.split('=')[0]:x.split('=')[1][:-1] for x in authz_header_items}
-        method = flow.request.method
-        service = authz_header_items["Credential"].split('/')[3]
-        host = flow.request.host
-        region = authz_header_items["Credential"].split('/')[2]
+    # parse out the signature so we can log it
+    sigv4_auth_header = req.headers['Authorization']
+    sigv4_auth_header_parts = [x.strip() for x in sigv4_auth_header.split(",")]
+    for part in sigv4_auth_header_parts:
+        if part.startswith("Signature"):
+            sigv4_signature = part.split("=")[1]
+    _logger.info(f"generated SigV4 signature: {sigv4_signature}")
 
-        request_cred = authz_header_items["Credential"].split('/')[0]
-        file_creds = load_creds_file()
-        access_key = None
-        secret_key = None
-        if USE_CRED is None:
-            # no credential selected, try to use whatever is already in
-            # the request
-            #print("no credential selected, trying to find key for {}".format(request_cred))
-            for name in file_creds:
-                if file_creds[name]["aws_access_key_id"] == request_cred:
-                    access_key = file_creds[name]["aws_access_key_id"]
-                    secret_key = file_creds[name]["aws_secret_access_key"]
-                    #print("found creds for access key {} in ~/.aws/credentials (entry \"[{}]\")".format(name))
-                    break
-        elif USE_CRED in file_creds:
-            #print("using credential \"[{}]\"".format(USE_CRED))
-            access_key = file_creds[USE_CRED]["aws_access_key_id"]
-            secret_key = file_creds[USE_CRED]["aws_secret_access_key"]
+    # prepare requests
+    req = req.prepare()
+    badSigReq = copy.deepcopy(req)
 
-        elif access_key is None or secret_key is None:
-            #print("can't find creds")
-            pass
-        else:
-            #print("WTF even happened")
-            raise ValueError("WTF")
+    # replace the "Signature" part of the header with all 0's to make it fail
+    badSigHeader = badSigReq.headers['Authorization']
+    sigIndex = badSigHeader.find("Signature=")
+    badSigHeader = f"{badSigHeader[0:sigIndex]}Signature={'0'*64}"
+    badSigReq.headers['Authorization'] = badSigHeader
 
-        try:
-            request_parameters = flow.request.path.split('?')[1]
-        except IndexError:
-            request_parameters = ""
-
-        # build the authorization header according to 
-        # https://docs.aws.amazon.com/general/latest/gr/sigv4-signed-request-examples.html
-        canonical_uri = flow.request.path.split('?')[0]
-        canonical_querystring = request_parameters
-        canonical_headers = 'host:' + host + '\n' + 'x-amz-date:' + amzdate + '\n'
-        signed_headers = 'host;x-amz-date'
-        payload_hash = hashlib.sha256(flow.request.content).hexdigest()
-        canonical_request = method + '\n' + canonical_uri + '\n' + canonical_querystring + '\n' + canonical_headers + '\n' + signed_headers + '\n' + payload_hash
-        canonical_request = method + '\n' + canonical_uri + '\n' + canonical_querystring + '\n' + canonical_headers + '\n' + signed_headers + '\n' + payload_hash
-        algorithm = 'AWS4-HMAC-SHA256'
-        credential_scope = datestamp + '/' + region + '/' + service + '/' + 'aws4_request'
-        string_to_sign = algorithm + '\n' +  amzdate + '\n' +  credential_scope + '\n' +  hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()
-        signing_key = getSignatureKey(secret_key, datestamp, region, service)
-        signature = hmac.new(signing_key, (string_to_sign).encode('utf-8'), hashlib.sha256).hexdigest()
-        authorization_header = algorithm + ' ' + 'Credential=' + access_key + '/' + credential_scope + ', ' +  'SignedHeaders=' + signed_headers + ', ' + 'Signature=' + signature
-        headers = {'x-amz-date':amzdate, 'Authorization':authorization_header}
-
-        flow.request.headers["x-amz-date"] = amzdate
-        flow.request.headers["Authorization"] = authorization_header
+    _logger.info(f"sending request with bad signature to ensure it is rejected")
+    badResponse = requests.request(method=badSigReq.method, url=badSigReq.url, headers=badSigReq.headers, data=badSigReq.body)
+    if badResponse.status_code == 403 and "does not match" in badResponse.text:
+        _logger.info(f"bad request rejected")
     else:
-        flow.request.headers["foo"] = "rawr"
+        _logger.error(f"intentionally bad request wasn't rejected with 403, check the response:\n{badResponse.text}")
+        raise ValueError(f"intentionally bad signature not properly rejected")
+
+
+    _logger.info(f"checking good signature:\n{req.headers['Authorization']}")
+    response = requests.request(method=req.method, url=req.url, headers=req.headers, data=req.body)
+    if response.status_code == 200:
+        _logger.info(f"Request accepted, signing is working:\n{response.text}")
+    else:
+        _logger.error(f"Request failed, signing may not be working:\n{response.text}")
+
+    #print(req.headers['Authorization'])
+
+
+
+
+
+
+
+
+
